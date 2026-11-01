@@ -19,6 +19,10 @@ queued, up to MAX_BATCH, and answers it with one pass. A request on an idle serv
 and under load the requests that arrived during one pass share the next. The input is built in the
 request handler, so a bad request never queues and the model's thread only runs the model.
 
+Overload is refused rather than queued. Past MAX_QUEUED waiting requests, or once one has waited
+MAX_WAIT_SECONDS, the answer is 503 {"error": "overloaded"}: a caller still waiting that long has usually
+moved on, and a pass spent on it would only make the next request late too.
+
 Every route but health checks X-Analysis-Key, failing closed.
 
 Built on maia3 (https://github.com/CSSLab/maia3, commit 1e13597c42d4858b7cfd7cfdae01e297263364b2). This
@@ -58,6 +62,8 @@ TOP_MOVES = 10
 MAX_MOVES = 7
 # A batch of 30 takes about 210 ms on one core; whatever is left over goes in the next pass.
 MAX_BATCH = 32
+MAX_QUEUED = 256
+MAX_WAIT_SECONDS = 1.0
 
 SPEC = resolve_model_spec(os.environ["MAIA_MODEL"])
 CFG = SimpleNamespace(**SPEC.config, device="cpu",
@@ -85,6 +91,10 @@ def load_model():
 
 class BadPosition(ValueError):
     """Why a request names no position to answer; the message is what the caller gets back."""
+
+
+class Overloaded(Exception):
+    """A request refused or dropped because the model cannot keep up."""
 
 
 def build_input(fen, moves):
@@ -148,6 +158,7 @@ def infer_batch(net, items):
 @dataclass
 class _Job:
     item: tuple
+    queued_at: float = field(default_factory=time.monotonic)
     future: Future = field(default_factory=Future)
 
 
@@ -169,6 +180,9 @@ class Engine:
     def start(self):
         self._thread.start()
 
+    def full(self):
+        return self._jobs.qsize() >= MAX_QUEUED
+
     def submit(self, item):
         job = _Job(item)
         self._jobs.put(job)
@@ -188,18 +202,32 @@ class Engine:
                  (time.perf_counter() - started) * 1000)
         self.ready.set()
         while True:
-            jobs = [self._jobs.get()]
-            while len(jobs) < MAX_BATCH:
-                try:
-                    jobs.append(self._jobs.get_nowait())
-                except queue.Empty:
-                    break
-            # A caller that has gone away cancelled its future: skip it rather than spend a pass on it.
-            jobs = [job for job in jobs if job.future.set_running_or_notify_cancel()]
-            if jobs:
-                self._answer(jobs)
+            self._answer(self._next_batch())
+
+    def _next_batch(self):
+        """Waits for a request, then takes whatever else is queued, up to MAX_BATCH.
+
+        A request that has waited too long is dropped here, costing no pass, and does not count against
+        the batch. A caller that merely disconnects cancels nothing, so this wait is what bounds the
+        work done for one. A future is only ever cancelled when the server shuts down.
+        """
+        jobs = []
+        while len(jobs) < MAX_BATCH:
+            try:
+                job = self._jobs.get(block=not jobs)
+            except queue.Empty:
+                break
+            if not job.future.set_running_or_notify_cancel():
+                continue
+            if time.monotonic() - job.queued_at > MAX_WAIT_SECONDS:
+                job.future.set_exception(Overloaded())
+                continue
+            jobs.append(job)
+        return jobs
 
     def _answer(self, jobs):
+        if not jobs:
+            return
         try:
             answers = infer_batch(self._net, [job.item for job in jobs])
         except Exception as e:
@@ -214,8 +242,9 @@ class Engine:
 class MoveRequest(BaseModel):
     fen: str = Field(max_length=100)
     moves: list[str] = Field(max_length=MAX_MOVES)
-    selfElo: int
-    oppoElo: int
+    # maia3's own range. Checked here because a value too large for a tensor would fail its whole batch.
+    selfElo: int = Field(ge=0, le=5000)
+    oppoElo: int = Field(ge=0, le=5000)
 
 
 def create_app(key, load=load_model, threads=None):
@@ -255,12 +284,17 @@ def create_app(key, load=load_model, threads=None):
         received = time.perf_counter()
         if not engine.ready.is_set():
             return JSONResponse({"error": "starting"}, status_code=503)
+        if engine.full():
+            return JSONResponse({"error": "overloaded"}, status_code=503)
         try:
             tokens, legal, black = build_input(body.fen, body.moves)
         except BadPosition as e:
             return JSONResponse({"error": str(e)}, status_code=400)
-        answer = await asyncio.wrap_future(
-            engine.submit((tokens, legal, black, body.selfElo, body.oppoElo)))
+        try:
+            answer = await asyncio.wrap_future(
+                engine.submit((tokens, legal, black, body.selfElo, body.oppoElo)))
+        except Overloaded:
+            return JSONResponse({"error": "overloaded"}, status_code=503)
         return {**answer, "ms": round((time.perf_counter() - received) * 1000)}
 
     return app

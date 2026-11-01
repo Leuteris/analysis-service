@@ -13,7 +13,8 @@ import torch
 from fastapi.testclient import TestClient
 from maia3.uci import Maia3UCIEngine, parse_args, wdl_from_value_logits
 
-from app import CFG, SPEC, build_input, create_app, infer_batch, load_model
+import app as service
+from app import ALL_MOVES, CFG, SPEC, build_input, create_app, infer_batch, load_model
 
 KEY = "test-key"
 HEADERS = {"X-Analysis-Key": KEY}
@@ -208,6 +209,58 @@ def test_requests_arriving_together_each_get_their_own_answer(client):
         assert all(abs(got[uci] - want[uci]) <= 2e-4 for uci in got)
 
 
+class HeldNet:
+    """A model that holds its pass until released, so a test can see what queues behind it."""
+
+    def __init__(self):
+        self.in_pass = threading.Event()
+        self.release = threading.Event()
+        self.passes = []
+
+    def __call__(self, tokens, self_elos, oppo_elos):
+        self.passes.append(len(tokens))
+        self.in_pass.set()
+        assert self.release.wait(10)
+        size = len(tokens)
+        return torch.zeros(size, len(ALL_MOVES)), torch.zeros(size, 3), torch.zeros(size)
+
+
+def test_a_request_that_waited_too_long_is_dropped_without_a_pass(monkeypatch):
+    monkeypatch.setattr(service, "MAX_WAIT_SECONDS", 0.05)
+    net = HeldNet()
+    with TestClient(create_app(KEY, load=lambda: net)) as c, ThreadPoolExecutor(2) as pool:
+        wait_until_up(c)
+        running = pool.submit(ask, c, START)
+        assert net.in_pass.wait(10)
+        waiting = pool.submit(ask, c, ITALIAN)
+        time.sleep(0.3)
+        net.release.set()
+        assert running.result(10).status_code == 200
+        response = waiting.result(10)
+    assert response.status_code == 503
+    assert response.json() == {"error": "overloaded"}
+    assert net.passes == [1]
+
+
+def test_a_full_queue_refuses_at_once(monkeypatch):
+    monkeypatch.setattr(service, "MAX_QUEUED", 1)
+    net = HeldNet()
+    with TestClient(create_app(KEY, load=lambda: net)) as c, ThreadPoolExecutor(2) as pool:
+        wait_until_up(c)
+        running = pool.submit(ask, c, START)
+        assert net.in_pass.wait(10)
+        waiting = pool.submit(ask, c, ITALIAN)
+        deadline = time.monotonic() + 10
+        response = ask(c, THREE_KING_MOVES)
+        while response.status_code != 503 and time.monotonic() < deadline:
+            response = ask(c, THREE_KING_MOVES)
+        net.release.set()
+        assert running.result(10).status_code == 200
+        waiting.result(10)
+    assert response.status_code == 503
+    assert response.json() == {"error": "overloaded"}
+
+
 def test_every_route_but_health_needs_the_key(client):
     assert ask(client, START, headers={}).status_code == 401
     assert ask(client, START, headers={"X-Analysis-Key": "wrong"}).status_code == 401
@@ -265,6 +318,9 @@ def test_a_request_with_nothing_to_answer_is_refused(client, fen, moves, error):
     {"fen": START, "selfElo": 1500, "oppoElo": 1500},
     {"fen": START, "moves": [], "selfElo": 1500.5, "oppoElo": 1500},
     {"fen": START, "moves": [], "selfElo": 1500},
+    {"fen": START, "moves": [], "selfElo": -1, "oppoElo": 1500},
+    {"fen": START, "moves": [], "selfElo": 1500, "oppoElo": 5001},
+    {"fen": START, "moves": [], "selfElo": 2 ** 70, "oppoElo": 1500},
 ])
 def test_a_malformed_request_is_refused(client, body):
     assert client.post("/maia/move", headers=HEADERS, json=body).status_code == 422
