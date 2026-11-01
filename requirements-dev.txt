@@ -1,0 +1,8 @@
+# The test stage only (Dockerfile target `test`); never in the runtime image.
+httpx==0.28.1
+httpcore==1.0.9
+iniconfig==2.3.1
+packaging==26.3
+pluggy==1.7.0
+Pygments==2.21.0
+pytest==9.2.0

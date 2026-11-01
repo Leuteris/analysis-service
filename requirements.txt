@@ -1,0 +1,41 @@
+# Every package the service runs on, pinned exactly: what `pip freeze` printed in the built image.
+# Regenerate the same way after changing a pin (build, then `docker run --rm <image> pip freeze`).
+# torch is the CPU-only wheel from PyTorch's own index: the PyPI one bundles CUDA, gigabytes a service
+# with no GPU has no use for. maia3 has no PyPI release, so it comes from GitHub at a pinned commit, as
+# an archive because the image has no git.
+--extra-index-url https://download.pytorch.org/whl/cpu
+annotated-doc==0.0.5
+annotated-types==0.8.0
+anyio==4.16.0
+chess==1.11.2
+click==8.5.0
+fastapi==0.162.0
+filelock==4.2.6
+fsspec==2026.9.0
+h11==0.16.0
+hf-xet==1.8.0
+httpcore2==2.16.0
+httpx2==2.16.0
+huggingface_hub==2.4.0
+idna==3.20
+Jinja2==3.1.6
+maia3 @ https://github.com/CSSLab/maia3/archive/1e13597c42d4858b7cfd7cfdae01e297263364b2.tar.gz#sha256=774c363dd2f2d10d6996ef5ef0bdba473ae769a79e442132bd82d0e999b7b488
+MarkupSafe==3.0.4
+mpmath==1.3.0
+networkx==3.7
+numpy==2.5.4
+opentelemetry-api==1.45.2
+packaging==26.3
+pydantic==2.14.1
+pydantic_core==2.50.1
+python-chess==1.999
+PyYAML==6.0.3
+setuptools==84.2.1
+starlette==1.10.0
+sympy==1.14.0
+torch==2.8.0+cpu
+tqdm==4.70.1
+truststore==0.10.5
+typing-inspection==0.4.4
+typing_extensions==4.16.0
+uvicorn==0.54.0
